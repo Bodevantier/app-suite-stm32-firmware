@@ -22,7 +22,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Set the project name
-set(CMAKE_PROJECT_NAME Sensor_to_N2K_PCB_V1.0_Test_15_SPI_N2K_Data)
+set(CMAKE_PROJECT_NAME PCB_V1.0_Test_1_N2K_to_SPI_N2K)
 
 # Enable compile command to ease indexing with e.g. clangd
 set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
@@ -49,16 +49,19 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # User C++ sources - Main application
     Core/Src/main.cpp
+    Core/Src/devicelist_handler.cpp
 
     # Raw NMEA2000 to SPI bridge modules
     Core/Src/n2k_raw_bridge.c
     Core/Src/raw_ring_buffer.c
     Core/Src/spi_packet.c
+    Core/Src/wind_averages.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Inc
+    Core/Libs/NMEA2000-master
 )
 
 # Add project symbols (macros)

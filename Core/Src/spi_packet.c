@@ -1,6 +1,7 @@
 #include "spi_packet.h"
 
 #include <string.h>
+#include <stdint.h>
 
 static uint8_t spi_packet_crc8(const uint8_t *data, size_t len) {
     uint8_t crc = 0x00u;
@@ -88,5 +89,96 @@ bool SPI_Packet_ParseFramePacket(const uint8_t *packet, size_t packet_len, uint8
     out_frame->dlc = dlc;
     out_frame->flags = packet[13];
     memcpy(out_frame->data, &packet[14], sizeof(out_frame->data));
+    return true;
+}
+
+bool SPI_Packet_BuildCustomPacket(uint8_t pkt_type,
+                                  const uint8_t *payload,
+                                  uint8_t payload_len,
+                                  uint8_t *out_buf,
+                                  size_t out_buf_size,
+                                  size_t *out_len) {
+    size_t i = 0u;
+    uint8_t crc;
+    size_t total_len;
+
+    if ((out_buf == 0) || (out_len == 0)) {
+        return false;
+    }
+    if ((payload_len > 0u) && (payload == 0)) {
+        return false;
+    }
+    if (payload_len > SPI_PACKET_MAX_PAYLOAD_LEN) {
+        return false;
+    }
+
+    total_len = 2u + 1u + 1u + (size_t)payload_len + 1u;
+    if (out_buf_size < total_len) {
+        return false;
+    }
+
+    out_buf[i++] = SPI_PACKET_SOF1;
+    out_buf[i++] = SPI_PACKET_SOF2;
+    out_buf[i++] = pkt_type;
+    out_buf[i++] = payload_len;
+
+    if (payload_len > 0u) {
+        memcpy(&out_buf[i], payload, payload_len);
+        i += payload_len;
+    }
+
+    crc = spi_packet_crc8(&out_buf[2], (size_t)2u + (size_t)payload_len);
+    out_buf[i++] = crc;
+    *out_len = i;
+    return true;
+}
+
+bool SPI_Packet_BuildBoatStatePacket(float aws_60s, float aws_5min, float aws_30min,
+                                     float tws_60s, float tws_5min, float tws_30min,
+                                     float vmg_ms,
+                                     float live_aws_mps, float live_awa_deg,
+                                     uint8_t *out_buf, size_t out_buf_size,
+                                     size_t *out_len) {
+    uint8_t payload[SPI_PACKET_BOAT_STATE_PAYLOAD_LEN];
+    size_t i = 0u;
+    float values[9];
+    uint8_t vi;
+    uint8_t crc;
+    size_t total_len;
+
+    if ((out_buf == 0) || (out_len == 0)) {
+        return false;
+    }
+
+    total_len = 2u + 1u + 1u + SPI_PACKET_BOAT_STATE_PAYLOAD_LEN + 1u;
+    if (out_buf_size < total_len) {
+        return false;
+    }
+
+    values[0] = aws_60s;
+    values[1] = aws_5min;
+    values[2] = aws_30min;
+    values[3] = tws_60s;
+    values[4] = tws_5min;
+    values[5] = tws_30min;
+    values[6] = vmg_ms;
+    values[7] = live_aws_mps;
+    values[8] = live_awa_deg;
+
+    /* Serialise each float as 4 bytes little-endian via memcpy to avoid
+     * strict-aliasing issues with direct pointer casts. */
+    for (vi = 0u; vi < 9u; vi++) {
+        memcpy(&payload[vi * 4u], &values[vi], 4u);
+    }
+
+    out_buf[i++] = SPI_PACKET_SOF1;
+    out_buf[i++] = SPI_PACKET_SOF2;
+    out_buf[i++] = SPI_PACKET_TYPE_BOAT_STATE;
+    out_buf[i++] = SPI_PACKET_BOAT_STATE_PAYLOAD_LEN;
+    memcpy(&out_buf[i], payload, SPI_PACKET_BOAT_STATE_PAYLOAD_LEN);
+    i += SPI_PACKET_BOAT_STATE_PAYLOAD_LEN;
+    crc = spi_packet_crc8(&out_buf[2], 2u + SPI_PACKET_BOAT_STATE_PAYLOAD_LEN);
+    out_buf[i++] = crc;
+    *out_len = i;
     return true;
 }

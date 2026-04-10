@@ -4,11 +4,12 @@
 #include <string.h>
 
 #include "main.h"
+#include "devicelist_handler.h"
 #include "raw_ring_buffer.h"
 #include "spi_packet.h"
 #include "usart.h"
 
-#define RAW_BRIDGE_RING_CAPACITY 128u
+#define RAW_BRIDGE_RING_CAPACITY 32u
 #define RAW_FRAME_FLAG_EXT_ID 0x01u
 #define RAW_FRAME_FLAG_RTR 0x02u
 #define RAW_FRAME_FLAG_DIRECTION 0x04u
@@ -16,7 +17,7 @@
 #define RAW_BRIDGE_SPI_MAX_PACKET_LEN 260u
 #define RAW_BRIDGE_DEBUG_UART 0u
 #define RAW_BRIDGE_DEBUG_LINE_LEN 320u
-#define RAW_BRIDGE_FAST_PACKET_SLOTS 6u
+#define RAW_BRIDGE_FAST_PACKET_SLOTS 3u
 #define RAW_BRIDGE_FAST_PACKET_MAX_DATA_LEN 223u
 #define N2K_PGN_ISO_REQUEST 59904ul
 #define N2K_PGN_ISO_ADDRESS_CLAIM 60928ul
@@ -29,6 +30,14 @@ static SPI_HandleTypeDef *s_hspi = 0;
 static RawRingBuffer_t s_ring;
 static N2K_RawFrame_t s_ring_storage[RAW_BRIDGE_RING_CAPACITY];
 static volatile N2K_RawBridgeStats_t s_stats = {0};
+static volatile N2K_RawBridgePgnDebug_t s_pgn_debug = {
+    .last_can_rx_pgn = UINT32_MAX,
+    .last_spi_to_can_pgn = UINT32_MAX
+};
+#define RAW_BRIDGE_RX_EVENT_CAPACITY 24u
+static N2K_RawBridgeRxEvent_t s_rx_events[RAW_BRIDGE_RX_EVENT_CAPACITY];
+static volatile uint16_t s_rx_event_head = 0u;
+static volatile uint16_t s_rx_event_tail = 0u;
 
 typedef enum {
     SPI_PARSE_WAIT_SOF1 = 0,
@@ -61,6 +70,29 @@ static SpiParser_t s_spi_parser = {0};
 #if RAW_BRIDGE_DEBUG_UART
 static RawBridgeFastPacketSlot_t s_fast_packet_slots[RAW_BRIDGE_FAST_PACKET_SLOTS] __attribute__((unused)) = {0};
 #endif
+
+/* ── N2K-RX fast-packet reassembly (always active) ─────────────────────── */
+#define RAW_BRIDGE_N2K_RX_FP_SLOTS    3u
+/* Capacity must hold all expected metadata responses per refresh cycle.
+ * Navigation PGNs (129029, 129284, etc.) are excluded from assembly so
+ * they cannot crowd out device-list metadata events (126464/126996/126998).
+ * Sized at 24: 4 metadata events per device × up to 6 devices. */
+#define RAW_BRIDGE_ASM_EVENT_CAPACITY  6u
+
+static RawBridgeFastPacketSlot_t     s_n2k_rx_fp_slots[RAW_BRIDGE_N2K_RX_FP_SLOTS];
+static N2K_RawBridgeAssembledEvent_t s_asm_events[RAW_BRIDGE_ASM_EVENT_CAPACITY];
+static volatile uint8_t              s_asm_head = 0u;
+static volatile uint8_t              s_asm_tail = 0u;
+
+typedef struct {
+    uint16_t len;
+    uint8_t bytes[RAW_BRIDGE_SPI_MAX_PACKET_LEN];
+} RawBridgeSpiQueuedPacket_t;
+
+#define RAW_BRIDGE_SPI_QUEUE_CAPACITY 4u
+static RawBridgeSpiQueuedPacket_t s_spi_queue[RAW_BRIDGE_SPI_QUEUE_CAPACITY];
+static volatile uint8_t s_spi_queue_head = 0u;
+static volatile uint8_t s_spi_queue_tail = 0u;
 
 #if RAW_BRIDGE_DEBUG_UART
 static void raw_bridge_uart_print(const char *text) {
@@ -734,6 +766,126 @@ static void raw_bridge_start_can(void) {
     }
 }
 
+static void raw_bridge_decode_can_id(
+    uint32_t can_id,
+    uint8_t is_extended_id,
+    uint8_t *priority_out,
+    uint32_t *pgn_out,
+    uint8_t *src_out,
+    uint8_t *dst_out
+) {
+    uint8_t can_id_pf;
+    uint8_t can_id_ps;
+    uint8_t can_id_dp;
+    uint8_t priority;
+    uint32_t pgn;
+    uint8_t src;
+    uint8_t dst;
+
+    if (is_extended_id == 0u) {
+        if (priority_out != 0) {
+            *priority_out = 0u;
+        }
+        if (pgn_out != 0) {
+            *pgn_out = UINT32_MAX;
+        }
+        if (src_out != 0) {
+            *src_out = 0u;
+        }
+        if (dst_out != 0) {
+            *dst_out = 0xFFu;
+        }
+        return;
+    }
+
+    can_id_pf = (uint8_t)(can_id >> 16u);
+    can_id_ps = (uint8_t)(can_id >> 8u);
+    can_id_dp = (uint8_t)((can_id >> 24u) & 0x01u);
+
+    src = (uint8_t)(can_id & 0xFFu);
+    priority = (uint8_t)((can_id >> 26u) & 0x07u);
+
+    if (can_id_pf < 240u) {
+        dst = can_id_ps;
+        pgn = (((uint32_t)can_id_dp) << 16u) | (((uint32_t)can_id_pf) << 8u);
+    } else {
+        dst = 0xFFu;
+        pgn = (((uint32_t)can_id_dp) << 16u) | (((uint32_t)can_id_pf) << 8u) | (uint32_t)can_id_ps;
+    }
+
+    if (priority_out != 0) {
+        *priority_out = priority;
+    }
+    if (pgn_out != 0) {
+        *pgn_out = pgn;
+    }
+    if (src_out != 0) {
+        *src_out = src;
+    }
+    if (dst_out != 0) {
+        *dst_out = dst;
+    }
+}
+
+static uint32_t raw_bridge_extract_pgn(uint32_t can_id, uint8_t is_extended_id) {
+    uint32_t pgn = UINT32_MAX;
+    raw_bridge_decode_can_id(can_id, is_extended_id, 0, &pgn, 0, 0);
+    return pgn;
+}
+
+static uint8_t raw_bridge_extract_source(uint32_t can_id) {
+    uint8_t src = 0u;
+    raw_bridge_decode_can_id(can_id, 1u, 0, 0, &src, 0);
+    return src;
+}
+
+static uint8_t raw_bridge_extract_destination(uint32_t can_id, uint8_t is_extended_id) {
+    uint8_t dst = 0xFFu;
+    raw_bridge_decode_can_id(can_id, is_extended_id, 0, 0, 0, &dst);
+    return dst;
+}
+
+static void raw_bridge_rx_event_push(const N2K_RawFrame_t *frame) {
+    uint16_t next_head;
+    uint32_t pgn;
+
+    if ((frame == 0) || ((frame->flags & RAW_FRAME_FLAG_EXT_ID) == 0u)) {
+        return;
+    }
+
+    /* Only queue PGNs that the DeviceListHandler actually processes.
+     * On a busy N2K bus the 64-slot queue overflows in <100 ms if every
+     * GPS / heading / wind frame is pushed, silently dropping the
+     * Address-Claim responses that the device-list refresh depends on. */
+    pgn = raw_bridge_extract_pgn(frame->can_id, 1u);
+    if (pgn != N2K_PGN_ISO_ADDRESS_CLAIM) {
+        return;
+    }
+
+    next_head = (uint16_t)((s_rx_event_head + 1u) % RAW_BRIDGE_RX_EVENT_CAPACITY);
+    if (next_head == s_rx_event_tail) {
+        return;
+    }
+
+    s_rx_events[s_rx_event_head].can_id = frame->can_id & 0x1FFFFFFFu;
+    raw_bridge_decode_can_id(
+        frame->can_id,
+        1u,
+        &s_rx_events[s_rx_event_head].priority,
+        &s_rx_events[s_rx_event_head].pgn,
+        &s_rx_events[s_rx_event_head].src,
+        &s_rx_events[s_rx_event_head].dst
+    );
+    s_rx_events[s_rx_event_head].timestamp_ms = frame->timestamp_ms;
+    s_rx_events[s_rx_event_head].dlc = frame->dlc;
+    memset(s_rx_events[s_rx_event_head].data, 0, sizeof(s_rx_events[s_rx_event_head].data));
+    if (frame->dlc > 0u) {
+        memcpy(s_rx_events[s_rx_event_head].data, frame->data, frame->dlc);
+    }
+
+    s_rx_event_head = next_head;
+}
+
 static uint8_t raw_bridge_crc8(const uint8_t *data, uint16_t len) {
     uint16_t i;
     uint8_t crc = 0x00u;
@@ -749,13 +901,189 @@ static void raw_bridge_spi_parse_reset(void) {
     s_spi_parser.expected_len = 0;
 }
 
-static void raw_bridge_can_transmit(const N2K_RawFrame_t *frame) {
+static uint8_t raw_bridge_spi_queue_push(const uint8_t *packet, uint16_t len) {
+    uint8_t next_head;
+    uint32_t primask;
+
+    if ((packet == 0) || (len == 0u) || (len > RAW_BRIDGE_SPI_MAX_PACKET_LEN)) {
+        return 0u;
+    }
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+    next_head = (uint8_t)((s_spi_queue_head + 1u) % RAW_BRIDGE_SPI_QUEUE_CAPACITY);
+    if (next_head == s_spi_queue_tail) {
+        s_stats.spi_queue_overflow++;
+        if (primask == 0u) {
+            __enable_irq();
+        }
+        return 0u;
+    }
+
+    s_spi_queue[s_spi_queue_head].len = len;
+    memcpy(s_spi_queue[s_spi_queue_head].bytes, packet, len);
+    s_spi_queue_head = next_head;
+    if (primask == 0u) {
+        __enable_irq();
+    }
+    return 1u;
+}
+
+static uint8_t raw_bridge_spi_queue_pop(uint8_t *packet_out, uint16_t *len_out) {
+    uint8_t has_packet = 0u;
+    uint32_t primask;
+
+    if ((packet_out == 0) || (len_out == 0)) {
+        return 0u;
+    }
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+    if (s_spi_queue_tail != s_spi_queue_head) {
+        uint16_t len = s_spi_queue[s_spi_queue_tail].len;
+        memcpy(packet_out, s_spi_queue[s_spi_queue_tail].bytes, len);
+        *len_out = len;
+        s_spi_queue_tail = (uint8_t)((s_spi_queue_tail + 1u) % RAW_BRIDGE_SPI_QUEUE_CAPACITY);
+        has_packet = 1u;
+    }
+    if (primask == 0u) {
+        __enable_irq();
+    }
+
+    return has_packet;
+}
+
+    static uint8_t raw_bridge_is_fast_pgn(uint32_t pgn) {
+        switch (pgn) {
+            /* Device-list metadata PGNs — must be assembled for DeviceListHandler. */
+            case  65240u: /* Proprietary */
+            case 126208u: /* NMEA Request/Command/Acknowledge */
+            case 126464u: /* PGN List (TX and RX) */
+            case 126996u: /* Product Information */
+            case 126998u: /* Configuration Information */
+                return 1u;
+            /* Navigation PGNs (129029 GNSS Position, 129284 Nav Data, etc.) are
+             * forwarded to the ESP32 as raw CAN frames via the ring buffer and do
+             * NOT need to go through the assembled-event pipeline.  Excluding them
+             * prevents continuous GPS broadcasts from filling the 8-slot queue and
+             * silently dropping PRODUCT_INFO events during a device-list refresh. */
+            default:
+                return 0u;
+        }
+    }
+
+    static RawBridgeFastPacketSlot_t *raw_bridge_rx_fp_find_slot(
+        uint8_t src, uint32_t pgn, uint8_t seq_id
+    ) {
+        uint8_t i;
+        for (i = 0u; i < RAW_BRIDGE_N2K_RX_FP_SLOTS; i++) {
+            RawBridgeFastPacketSlot_t *s = &s_n2k_rx_fp_slots[i];
+            if ((s->in_use != 0u) &&
+                (s->source == src) &&
+                (s->pgn == pgn) &&
+                (s->sequence_id == seq_id)) {
+                return s;
+            }
+        }
+        return 0;
+    }
+
+    static RawBridgeFastPacketSlot_t *raw_bridge_rx_fp_alloc_slot(void) {
+        uint8_t i;
+        for (i = 0u; i < RAW_BRIDGE_N2K_RX_FP_SLOTS; i++) {
+            if (s_n2k_rx_fp_slots[i].in_use == 0u) {
+                return &s_n2k_rx_fp_slots[i];
+            }
+        }
+        memset(&s_n2k_rx_fp_slots[0], 0, sizeof(s_n2k_rx_fp_slots[0]));
+        return &s_n2k_rx_fp_slots[0];
+    }
+
+    static void raw_bridge_asm_push(
+        uint32_t pgn, uint8_t src, uint8_t dst,
+        const uint8_t *data, uint16_t len
+    ) {
+        uint8_t next_head = (uint8_t)((s_asm_head + 1u) % RAW_BRIDGE_ASM_EVENT_CAPACITY);
+        if (next_head == s_asm_tail) {
+            return;
+        }
+        s_asm_events[s_asm_head].pgn = pgn;
+        s_asm_events[s_asm_head].src = src;
+        s_asm_events[s_asm_head].dst = dst;
+        s_asm_events[s_asm_head].len = len;
+        memcpy(s_asm_events[s_asm_head].data, data, len);
+        s_asm_head = next_head;
+    }
+
+    static void raw_bridge_n2k_rx_fp_feed(const N2K_RawFrame_t *frame) {
+        RawBridgeFastPacketSlot_t *slot;
+        uint8_t frame_index;
+        uint8_t sequence_id;
+        uint8_t source;
+        uint8_t dst;
+        uint32_t pgn;
+        uint16_t copy_len;
+        uint16_t remaining;
+
+        if (frame->dlc == 0u) {
+            return;
+        }
+            pgn = raw_bridge_extract_pgn(frame->can_id, 1u);
+            if (raw_bridge_is_fast_pgn(pgn) == 0u) {
+                return;
+            }
+            source      = raw_bridge_extract_source(frame->can_id);
+            dst         = raw_bridge_extract_destination(frame->can_id, 1u);
+        sequence_id = (uint8_t)(frame->data[0] >> 5u);
+        frame_index = (uint8_t)(frame->data[0] & 0x1Fu);
+
+        if (frame_index == 0u) {
+            uint16_t expected_len;
+            if (frame->dlc < 2u) { return; }
+            expected_len = (uint16_t)frame->data[1];
+            if ((expected_len == 0u) || (expected_len > RAW_BRIDGE_FAST_PACKET_MAX_DATA_LEN)) { return; }
+            slot = raw_bridge_rx_fp_find_slot(source, pgn, sequence_id);
+            if (slot == 0) { slot = raw_bridge_rx_fp_alloc_slot(); }
+            memset(slot, 0, sizeof(*slot));
+            slot->in_use           = 1u;
+            slot->is_ble_to_n2k    = dst;
+            slot->source           = source;
+            slot->sequence_id      = sequence_id;
+            slot->pgn              = pgn;
+            slot->expected_len     = expected_len;
+            slot->next_frame_index = 1u;
+            copy_len = (uint16_t)(frame->dlc - 2u);
+            if (copy_len > expected_len) { copy_len = expected_len; }
+            if (copy_len > 0u) { memcpy(slot->data, &frame->data[2], copy_len); }
+            slot->data_len = copy_len;
+        } else {
+            slot = raw_bridge_rx_fp_find_slot(source, pgn, sequence_id);
+            if ((slot == 0) || (slot->next_frame_index != frame_index)) { return; }
+            remaining = (uint16_t)(slot->expected_len - slot->data_len);
+            copy_len  = (uint16_t)(frame->dlc - 1u);
+            if (copy_len > remaining) { copy_len = remaining; }
+            if ((copy_len > 0u) &&
+                ((uint16_t)(slot->data_len + copy_len) <= RAW_BRIDGE_FAST_PACKET_MAX_DATA_LEN)) {
+                memcpy(&slot->data[slot->data_len], &frame->data[1], copy_len);
+                slot->data_len = (uint16_t)(slot->data_len + copy_len);
+            }
+            slot->next_frame_index++;
+        }
+
+        if (slot->data_len >= slot->expected_len) {
+            raw_bridge_asm_push(pgn, source, slot->is_ble_to_n2k,
+                                slot->data, slot->expected_len);
+            memset(slot, 0, sizeof(*slot));
+        }
+    }
+
+static uint8_t raw_bridge_can_transmit(const N2K_RawFrame_t *frame) {
     CAN_TxHeaderTypeDef tx_header;
     uint32_t tx_mailbox;
 
     if (frame->dlc > 8u) {
         s_stats.can_tx_errors++;
-        return;
+        return 0u;
     }
 
     memset(&tx_header, 0, sizeof(tx_header));
@@ -771,14 +1099,22 @@ static void raw_bridge_can_transmit(const N2K_RawFrame_t *frame) {
 
     if (HAL_CAN_GetTxMailboxesFreeLevel(s_hcan) == 0u) {
         s_stats.can_tx_errors++;
-        return;
+        return 0u;
     }
 
     if (HAL_CAN_AddTxMessage(s_hcan, &tx_header, (uint8_t *)frame->data, &tx_mailbox) == HAL_OK) {
         s_stats.can_tx_frames++;
+        if ((frame->flags & RAW_FRAME_FLAG_EXT_ID) != 0u) {
+            s_pgn_debug.last_spi_to_can_pgn = raw_bridge_extract_pgn(frame->can_id, 1u);
+            s_pgn_debug.last_spi_to_can_src = raw_bridge_extract_source(frame->can_id);
+            s_pgn_debug.last_spi_to_can_dst = raw_bridge_extract_destination(frame->can_id, 1u);
+            s_pgn_debug.spi_to_can_pgn_updates++;
+        }
         raw_bridge_debug_device_list_frame("BLE->N2K", frame);
+        return 1u;
     } else {
         s_stats.can_tx_errors++;
+        return 0u;
     }
 }
 
@@ -814,6 +1150,13 @@ static void raw_bridge_handle_spi_packet(const uint8_t *packet, uint16_t packet_
 
     if (pkt_type == SPI_PACKET_TYPE_STATUS) {
         s_stats.spi_rx_packets++;
+        return;
+    }
+
+    if (pkt_type == SPI_PACKET_TYPE_DEVICE_LIST_REQUEST) {
+        uint8_t payload_len = packet[3];
+        s_stats.spi_rx_packets++;
+        DeviceListHandler_OnSpiRequest(&packet[4], payload_len);
         return;
     }
 
@@ -897,8 +1240,21 @@ void N2K_RawBridge_Init(CAN_HandleTypeDef *hcan, SPI_HandleTypeDef *hspi) {
     s_hcan = hcan;
     s_hspi = hspi;
     memset((void *)&s_stats, 0, sizeof(s_stats));
+    memset((void *)&s_pgn_debug, 0, sizeof(s_pgn_debug));
+    s_pgn_debug.last_can_rx_pgn = UINT32_MAX;
+    s_pgn_debug.last_spi_to_can_pgn = UINT32_MAX;
+    memset((void *)s_rx_events, 0, sizeof(s_rx_events));
+    s_rx_event_head = 0u;
+    s_rx_event_tail = 0u;
 
     RawRingBuffer_Init(&s_ring, s_ring_storage, RAW_BRIDGE_RING_CAPACITY);
+    memset(s_n2k_rx_fp_slots, 0, sizeof(s_n2k_rx_fp_slots));
+    memset(s_asm_events, 0, sizeof(s_asm_events));
+    s_asm_head = 0u;
+    s_asm_tail = 0u;
+    memset(s_spi_queue, 0, sizeof(s_spi_queue));
+    s_spi_queue_head = 0u;
+    s_spi_queue_tail = 0u;
     raw_bridge_spi_parse_reset();
 
     HAL_GPIO_WritePin(CS_EXT_GPIO_Port, CS_EXT_Pin, GPIO_PIN_SET);
@@ -909,10 +1265,45 @@ void N2K_RawBridge_Init(CAN_HandleTypeDef *hcan, SPI_HandleTypeDef *hspi) {
 
 void N2K_RawBridge_Process(void) {
     N2K_RawFrame_t frame;
-    uint8_t packet[SPI_PACKET_TOTAL_LEN];
-    uint8_t spi_rx[SPI_PACKET_TOTAL_LEN];
+    uint8_t packet[RAW_BRIDGE_SPI_MAX_PACKET_LEN];
+    uint8_t spi_rx[RAW_BRIDGE_SPI_MAX_PACKET_LEN];
     size_t packet_len = 0;
+    uint16_t queued_len = 0u;
     uint8_t frames_sent = 0u;
+    char line[96];
+
+    while (raw_bridge_spi_queue_pop(packet, &queued_len) != 0u) {
+        uint8_t sent = 0u;
+        uint8_t attempts = 0u;
+
+        if (frames_sent > 0u) {
+            HAL_Delay(5u);
+        }
+
+        while (attempts < 3u) {
+            attempts++;
+            if (raw_bridge_spi_transfer(packet, spi_rx, queued_len) != 0u) {
+                sent = 1u;
+                s_stats.spi_tx_frames++;
+                HAL_GPIO_TogglePin(LED2_GPIO_Port, LED2_Pin);
+                break;
+            }
+            HAL_Delay(5u);
+        }
+
+        if ((packet[2] == SPI_PACKET_TYPE_DEVICE_LIST) ||
+            (packet[2] == SPI_PACKET_TYPE_DEVICE_LIST_REQUEST)) {
+            (void)snprintf(line,
+                           sizeof(line),
+                           "[SPIQ] type=0x%02X len=%u result=%s tries=%u\r\n",
+                           (unsigned)packet[2],
+                           (unsigned)queued_len,
+                           sent != 0u ? "ok" : "fail",
+                           (unsigned)attempts);
+            HAL_UART_Transmit(&huart1, (uint8_t *)line, (uint16_t)strlen(line), 100u);
+        }
+        frames_sent++;
+    }
 
     /* Drain the ring buffer FIRST, before any poll.
      * The ESP32 SPI slave needs ~5-20 us to process a completed transaction
@@ -920,8 +1311,13 @@ void N2K_RawBridge_Process(void) {
      * packet would follow within ~500 ns (a few STM32 instructions) — well
      * inside the ESP32 re-queue blind spot.  By skipping the poll when there
      * is data, the frame is sent while the ESP32 is already idle in
-     * spi_slave_transmit from the previous cycle. */
-    while (RawRingBuffer_Pop(&s_ring, &frame)) {
+     * spi_slave_transmit from the previous cycle.
+     *
+     * Limit to 8 frames per call so the main loop can process device-list
+     * events (address-claim responses, assembled metadata) between batches.
+     * Without this cap a busy bus keeps us in this loop for 100+ ms,
+     * starving the DeviceListHandler and causing event-queue overflows. */
+    while ((frames_sent < 8u) && RawRingBuffer_Pop(&s_ring, &frame)) {
         if (!SPI_Packet_BuildFramePacket(SPI_PACKET_TYPE_N2K_RX_FRAME, &frame, packet, sizeof(packet), &packet_len)) {
             continue;
         }
@@ -940,12 +1336,15 @@ void N2K_RawBridge_Process(void) {
         frames_sent++;
     }
 
-    /* Only poll (for ESP32 -> CAN TX direction) when there were no frames to
-     * send.  This keeps the bidirectional link alive without creating a
-     * back-to-back collision with an outbound frame send. */
-    if (frames_sent == 0u) {
-        raw_bridge_spi_poll();
+    /* Always poll so we read any pending ESP32-to-STM32 command (such as
+     * a device-list request) even when outbound CAN frames were sent.
+     * The SPI transfer for outbound frames also reads MISO bytes, but
+     * the device-list request might arrive in a later ESP32 DMA slot
+     * that only a dedicated poll transaction can pick up. */
+    if (frames_sent > 0u) {
+        HAL_Delay(5u);
     }
+    raw_bridge_spi_poll();
 }
 
 N2K_RawBridgeStats_t N2K_RawBridge_GetStats(void) {
@@ -958,6 +1357,107 @@ N2K_RawBridgeStats_t N2K_RawBridge_GetStats(void) {
     }
     return copy;
 }
+
+N2K_RawBridgePgnDebug_t N2K_RawBridge_GetPgnDebug(void) {
+    N2K_RawBridgePgnDebug_t copy;
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    copy = s_pgn_debug;
+    if (primask == 0u) {
+        __enable_irq();
+    }
+    return copy;
+}
+
+uint8_t N2K_RawBridge_PopRxEvent(N2K_RawBridgeRxEvent_t *event_out) {
+    uint8_t has_event = 0u;
+    uint32_t primask;
+
+    if (event_out == 0) {
+        return 0u;
+    }
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+    if (s_rx_event_tail != s_rx_event_head) {
+        *event_out = s_rx_events[s_rx_event_tail];
+        s_rx_event_tail = (uint16_t)((s_rx_event_tail + 1u) % RAW_BRIDGE_RX_EVENT_CAPACITY);
+        has_event = 1u;
+    }
+    if (primask == 0u) {
+        __enable_irq();
+    }
+
+    return has_event;
+}
+
+    uint8_t N2K_RawBridge_PopAssembledEvent(N2K_RawBridgeAssembledEvent_t *event_out) {
+        uint8_t has_event = 0u;
+        uint32_t primask;
+
+        if (event_out == 0) {
+            return 0u;
+        }
+
+        primask = __get_PRIMASK();
+        __disable_irq();
+        if (s_asm_tail != s_asm_head) {
+            *event_out = s_asm_events[s_asm_tail];
+            s_asm_tail = (uint8_t)((s_asm_tail + 1u) % RAW_BRIDGE_ASM_EVENT_CAPACITY);
+            has_event = 1u;
+        }
+        if (primask == 0u) {
+            __enable_irq();
+        }
+
+        return has_event;
+    }
+
+    uint8_t N2K_RawBridge_SendIsoRequest(uint8_t src, uint8_t dst, uint32_t requested_pgn) {
+        N2K_RawFrame_t frame;
+        uint32_t can_id;
+
+        /* PGN 59904 (ISO Request): prio=6, PF=0xEA, PS=dst, DP=0 */
+        if (s_hcan == 0) {
+            return 0u;
+        }
+
+        memset(&frame, 0, sizeof(frame));
+        can_id = ((uint32_t)6u << 26u) |
+                 ((uint32_t)0u << 24u) |
+                 ((uint32_t)0xEAu << 16u) |
+                 ((uint32_t)dst << 8u) |
+                 (uint32_t)src;
+
+        frame.can_id = can_id;
+        frame.flags = RAW_FRAME_FLAG_EXT_ID;
+        frame.dlc = 3u;
+        frame.data[0] = (uint8_t)(requested_pgn & 0xFFu);
+        frame.data[1] = (uint8_t)((requested_pgn >> 8u) & 0xFFu);
+        frame.data[2] = (uint8_t)((requested_pgn >> 16u) & 0xFFu);
+
+        return raw_bridge_can_transmit(&frame);
+    }
+
+    uint8_t N2K_RawBridge_QueueSpiPacket(uint8_t pkt_type, const uint8_t *payload, uint8_t payload_len) {
+        uint8_t packet[RAW_BRIDGE_SPI_MAX_PACKET_LEN];
+        size_t packet_len = 0u;
+
+        if (!SPI_Packet_BuildCustomPacket(pkt_type,
+                                          payload,
+                                          payload_len,
+                                          packet,
+                                          sizeof(packet),
+                                          &packet_len)) {
+            return 0u;
+        }
+
+        if (packet_len > 0xFFFFu) {
+            return 0u;
+        }
+
+        return raw_bridge_spi_queue_push(packet, (uint16_t)packet_len);
+    }
 
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
     CAN_RxHeaderTypeDef rx_header;
@@ -999,6 +1499,20 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
         }
         if (dlc > 0u) {
             memcpy(frame.data, data, dlc);
+        }
+
+        if ((frame.flags & RAW_FRAME_FLAG_EXT_ID) != 0u) {
+            s_pgn_debug.last_can_rx_pgn = raw_bridge_extract_pgn(frame.can_id, 1u);
+            s_pgn_debug.last_can_rx_src = raw_bridge_extract_source(frame.can_id);
+            s_pgn_debug.last_can_rx_dst = raw_bridge_extract_destination(frame.can_id, 1u);
+            s_pgn_debug.last_can_rx_dlc = dlc;
+            memset((void *)s_pgn_debug.last_can_rx_data, 0, sizeof(s_pgn_debug.last_can_rx_data));
+            if (dlc > 0u) {
+                memcpy((void *)s_pgn_debug.last_can_rx_data, frame.data, dlc);
+            }
+            s_pgn_debug.can_rx_pgn_updates++;
+            raw_bridge_rx_event_push(&frame);
+                raw_bridge_n2k_rx_fp_feed(&frame);
         }
 
         if (!RawRingBuffer_Push(&s_ring, &frame)) {
