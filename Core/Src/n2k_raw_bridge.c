@@ -94,6 +94,14 @@ static RawBridgeSpiQueuedPacket_t s_spi_queue[RAW_BRIDGE_SPI_QUEUE_CAPACITY];
 static volatile uint8_t s_spi_queue_head = 0u;
 static volatile uint8_t s_spi_queue_tail = 0u;
 
+/* Separate log-only event queue: all extended-ID PGNs, used only for UART
+ * debug printing in the main loop. Kept small — main loop drains it quickly
+ * and we rate-limit high-frequency PGNs in the consumer. */
+#define RAW_BRIDGE_LOG_EVENT_CAPACITY 16u
+static N2K_RawBridgeRxEvent_t s_log_events[RAW_BRIDGE_LOG_EVENT_CAPACITY];
+static volatile uint16_t s_log_event_head = 0u;
+static volatile uint16_t s_log_event_tail = 0u;
+
 #if RAW_BRIDGE_DEBUG_UART
 static void raw_bridge_uart_print(const char *text) {
 #if RAW_BRIDGE_DEBUG_UART
@@ -886,6 +894,30 @@ static void raw_bridge_rx_event_push(const N2K_RawFrame_t *frame) {
     s_rx_event_head = next_head;
 }
 
+static void raw_bridge_log_event_push(const N2K_RawFrame_t *frame) {
+    uint16_t log_next;
+    N2K_RawBridgeRxEvent_t *slot;
+
+    if ((frame == 0) || ((frame->flags & RAW_FRAME_FLAG_EXT_ID) == 0u)) {
+        return;
+    }
+    log_next = (uint16_t)((s_log_event_head + 1u) % RAW_BRIDGE_LOG_EVENT_CAPACITY);
+    if (log_next == s_log_event_tail) {
+        return;
+    }
+    slot = &s_log_events[s_log_event_head];
+    slot->can_id = frame->can_id & 0x1FFFFFFFu;
+    raw_bridge_decode_can_id(frame->can_id, 1u,
+        &slot->priority, &slot->pgn, &slot->src, &slot->dst);
+    slot->timestamp_ms = frame->timestamp_ms;
+    slot->dlc = frame->dlc;
+    memset(slot->data, 0, sizeof(slot->data));
+    if (frame->dlc > 0u) {
+        memcpy(slot->data, frame->data, frame->dlc);
+    }
+    s_log_event_head = log_next;
+}
+
 static uint8_t raw_bridge_crc8(const uint8_t *data, uint16_t len) {
     uint16_t i;
     uint8_t crc = 0x00u;
@@ -1252,6 +1284,9 @@ void N2K_RawBridge_Init(CAN_HandleTypeDef *hcan, SPI_HandleTypeDef *hspi) {
     memset(s_asm_events, 0, sizeof(s_asm_events));
     s_asm_head = 0u;
     s_asm_tail = 0u;
+    memset(s_log_events, 0, sizeof(s_log_events));
+    s_log_event_head = 0u;
+    s_log_event_tail = 0u;
     memset(s_spi_queue, 0, sizeof(s_spi_queue));
     s_spi_queue_head = 0u;
     s_spi_queue_tail = 0u;
@@ -1391,6 +1426,26 @@ uint8_t N2K_RawBridge_PopRxEvent(N2K_RawBridgeRxEvent_t *event_out) {
     return has_event;
 }
 
+uint8_t N2K_RawBridge_PopLogEvent(N2K_RawBridgeRxEvent_t *event_out) {
+    uint8_t has_event = 0u;
+    uint32_t primask;
+
+    if (event_out == 0) {
+        return 0u;
+    }
+    primask = __get_PRIMASK();
+    __disable_irq();
+    if (s_log_event_tail != s_log_event_head) {
+        *event_out = s_log_events[s_log_event_tail];
+        s_log_event_tail = (uint16_t)((s_log_event_tail + 1u) % RAW_BRIDGE_LOG_EVENT_CAPACITY);
+        has_event = 1u;
+    }
+    if (primask == 0u) {
+        __enable_irq();
+    }
+    return has_event;
+}
+
     uint8_t N2K_RawBridge_PopAssembledEvent(N2K_RawBridgeAssembledEvent_t *event_out) {
         uint8_t has_event = 0u;
         uint32_t primask;
@@ -1512,6 +1567,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
             }
             s_pgn_debug.can_rx_pgn_updates++;
             raw_bridge_rx_event_push(&frame);
+            raw_bridge_log_event_push(&frame);
                 raw_bridge_n2k_rx_fp_feed(&frame);
         }
 

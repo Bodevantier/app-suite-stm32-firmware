@@ -862,6 +862,21 @@ void DeviceListHandler_OnRxEvent(const N2K_RawBridgeRxEvent_t *event) {
   dev->industry_group = (uint8_t)((name >> 60u) & 0x07u);
 
   mark_seen(event->src, kMaskAddressClaim);
+
+  {
+    char line[160];
+    (void)snprintf(line, sizeof(line),
+      "[AC] src=%u mfr=%u uid=%lu cls=%u fn=%u ig=%u inst=%u\r\n",
+      (unsigned)event->src,
+      (unsigned)dev->manufacturer,
+      (unsigned long)dev->unique,
+      (unsigned)dev->device_class,
+      (unsigned)dev->device_function,
+      (unsigned)dev->industry_group,
+      (unsigned)dev->device_instance);
+    handler_uart_print(line);
+  }
+
   request_follow_up_metadata(dev);
   s_refresh_last_activity_ms = HAL_GetTick();
 }
@@ -886,15 +901,51 @@ void DeviceListHandler_OnAssembledEvent(const N2K_RawBridgeAssembledEvent_t *eve
   if (event->pgn == kPgnProductInfo) {
     update_product_info(dev, event->data, event->len);
     mark_seen(event->src, kMaskProductInfo);
+    {
+      char line[160];
+      (void)snprintf(line, sizeof(line),
+        "[META] src=%u product_info len=%u model='%s' sw='%s'\r\n",
+        (unsigned)event->src,
+        (unsigned)event->len,
+        (dev->model_id != nullptr) ? dev->model_id : "",
+        (dev->sw_version != nullptr) ? dev->sw_version : "");
+      handler_uart_print(line);
+    }
   } else if (event->pgn == kPgnConfigInfo) {
     update_config_info(dev, event->data, event->len);
     mark_seen(event->src, kMaskConfigInfo);
+    {
+      char line[160];
+      (void)snprintf(line, sizeof(line),
+        "[META] src=%u config_info len=%u inst1='%s' inst2='%s'\r\n",
+        (unsigned)event->src,
+        (unsigned)event->len,
+        (dev->installation1 != nullptr) ? dev->installation1 : "",
+        (dev->installation2 != nullptr) ? dev->installation2 : "");
+      handler_uart_print(line);
+    }
   } else {
     update_pgn_list(dev, event->data, event->len);
     if ((event->len > 0u) && (event->data[0] == 0u)) {
       mark_seen(event->src, kMaskTxPgnList);
+      {
+        char line[120];
+        (void)snprintf(line, sizeof(line),
+          "[META] src=%u tx_pgn_list count=%u\r\n",
+          (unsigned)event->src,
+          (unsigned)dev->tx_pgn_count);
+        handler_uart_print(line);
+      }
     } else if ((event->len > 0u) && (event->data[0] == 1u)) {
       mark_seen(event->src, kMaskRxPgnList);
+      {
+        char line[120];
+        (void)snprintf(line, sizeof(line),
+          "[META] src=%u rx_pgn_list count=%u\r\n",
+          (unsigned)event->src,
+          (unsigned)dev->rx_pgn_count);
+        handler_uart_print(line);
+      }
     }
   }
 

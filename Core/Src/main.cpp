@@ -597,9 +597,12 @@ int main(void)
 
     N2K_RawBridge_Process();
 
+    while (N2K_RawBridge_PopLogEvent(&event) != 0u) {
+      bridge_log_n2k_rx_event(&event);
+    }
+
     while (N2K_RawBridge_PopRxEvent(&event) != 0u) {
       DeviceListHandler_OnRxEvent(&event);
-      bridge_log_n2k_rx_event(&event);
 
       /* Feed wind averages module from relevant PGNs. */
       {
@@ -697,6 +700,32 @@ int main(void)
                                      bs_payload,
                                      SPI_PACKET_BOAT_STATE_PAYLOAD_LEN);
         s_last_boat_state_ms = now_ms;
+      }
+    }
+
+    /* Periodic CAN/SPI stats heartbeat — printed every 5 s.
+     * can_rx=0 after bus activity → MCU is not receiving CAN frames.
+     * can_rx>0 but no PGN lines → rx-event path is broken. */
+    {
+      static uint32_t s_last_stats_ms = 0u;
+      uint32_t now_ms = HAL_GetTick();
+      if ((now_ms - s_last_stats_ms) >= 5000u) {
+        s_last_stats_ms = now_ms;
+        N2K_RawBridgeStats_t   st  = N2K_RawBridge_GetStats();
+        N2K_RawBridgePgnDebug_t dbg = N2K_RawBridge_GetPgnDebug();
+        char line[160];
+        (void)snprintf(line, sizeof(line),
+          "[STATS] t=%lus can_rx=%lu ovf=%lu spi_tx=%lu spi_rx=%lu "
+          "last_pgn=%lu last_src=%u updates=%lu\r\n",
+          (unsigned long)(now_ms / 1000u),
+          (unsigned long)st.can_rx_frames,
+          (unsigned long)st.can_rx_overflow,
+          (unsigned long)st.spi_tx_frames,
+          (unsigned long)st.spi_rx_packets,
+          (unsigned long)dbg.last_can_rx_pgn,
+          (unsigned)dbg.last_can_rx_src,
+          (unsigned long)dbg.can_rx_pgn_updates);
+        bridge_uart_print(line);
       }
     }
 

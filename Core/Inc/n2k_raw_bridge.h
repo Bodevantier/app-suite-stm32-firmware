@@ -57,6 +57,7 @@ void N2K_RawBridge_Process(void);
 N2K_RawBridgeStats_t N2K_RawBridge_GetStats(void);
 N2K_RawBridgePgnDebug_t N2K_RawBridge_GetPgnDebug(void);
 uint8_t N2K_RawBridge_PopRxEvent(N2K_RawBridgeRxEvent_t *event_out);
+uint8_t N2K_RawBridge_PopLogEvent(N2K_RawBridgeRxEvent_t *event_out);
 uint8_t N2K_RawBridge_PopAssembledEvent(N2K_RawBridgeAssembledEvent_t *event_out);
 uint8_t N2K_RawBridge_SendIsoRequest(uint8_t src, uint8_t dst, uint32_t requested_pgn);
 uint8_t N2K_RawBridge_QueueSpiPacket(uint8_t pkt_type, const uint8_t *payload, uint8_t payload_len);
