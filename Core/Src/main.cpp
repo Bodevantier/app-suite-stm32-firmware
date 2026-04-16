@@ -27,9 +27,6 @@
 /* USER CODE BEGIN Includes */
 #include "devicelist_handler.h"
 #include "n2k_raw_bridge.h"
-#include "wind_averages.h"
-#include "spi_packet.h"
-#include <math.h>
 #include <stdio.h>
 #include <string.h>
 /* USER CODE END Includes */
@@ -51,16 +48,6 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
-static WindAverages_t s_wind_avg;
-/* Interval at which the BOAT_STATE packet is sent over SPI (ms) */
-#define BOAT_STATE_SEND_INTERVAL_MS 1000u
-static uint32_t s_last_boat_state_ms = 0u;
-/* Last true-wind and SOG readings used to derive live apparent wind. */
-static float s_live_tws_mps = 0.0f;
-static float s_live_twa_deg = 0.0f;
-static bool  s_live_tws_valid = false;
-static float s_live_sog_mps  = 0.0f;
-static bool  s_live_sog_valid = false;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -579,7 +566,6 @@ int main(void)
   N2K_RawBridge_Init(&hcan, &hspi1);
   bridge_uart_print("N2K bridge init ok\r\n");
   DeviceListHandler_Init();
-  WindAverages_Init(&s_wind_avg);
 
   /* USER CODE END 2 */
 
@@ -603,49 +589,6 @@ int main(void)
 
     while (N2K_RawBridge_PopRxEvent(&event) != 0u) {
       DeviceListHandler_OnRxEvent(&event);
-
-      /* Feed wind averages module from relevant PGNs. */
-      {
-        uint32_t now_ms = HAL_GetTick();
-        if (event.pgn == 130306u && event.dlc >= 6u) {
-          /* PGN 130306: Wind.
-           * bytes 1-2: speed (u16 × 0.01 m/s).
-           * bytes 3-4: angle (u16 × 0.0001 rad).
-           * byte 5 bits 0-2: 2 = Apparent, else treat as True. */
-          uint16_t spd_raw = (uint16_t)event.data[1] | ((uint16_t)event.data[2] << 8u);
-          uint16_t ang_raw = (uint16_t)event.data[3] | ((uint16_t)event.data[4] << 8u);
-          uint8_t  ref     = event.data[5] & 0x07u;
-          float    spd_mps = (float)spd_raw * 0.01f;
-          float    ang_deg = (float)ang_raw * 0.0001f * (180.0f / 3.14159265f);
-          if (spd_raw != 0xFFFFu) {
-            if (ref == 2u) {
-              /* Apparent wind */
-              WindAverages_AddAws(&s_wind_avg, spd_mps, now_ms);
-            } else {
-              /* True wind (ref 0=True, 1=Mag, 3=BoatRef, 4=WaterRef) */
-              WindAverages_AddTws(&s_wind_avg, spd_mps, now_ms);
-              if (ang_raw != 0xFFFFu) {
-                WindAverages_AddTwa(&s_wind_avg, ang_deg);
-                /* Store live TWS/TWA for apparent-wind derivation. */
-                s_live_tws_mps   = spd_mps;
-                s_live_twa_deg   = ang_deg;
-                s_live_tws_valid = true;
-              }
-            }
-            WindAverages_Recompute(&s_wind_avg, now_ms);
-          }
-        } else if (event.pgn == 129026u && event.dlc >= 6u) {
-          /* PGN 129026: COG/SOG rapid.
-           * bytes 4-5: SOG (u16 × 0.01 m/s). */
-          uint16_t sog_raw = (uint16_t)event.data[4] | ((uint16_t)event.data[5] << 8u);
-          if (sog_raw != 0xFFFFu) {
-            float sog_mps = (float)sog_raw * 0.01f;
-            WindAverages_AddSog(&s_wind_avg, sog_mps, now_ms);
-            s_live_sog_mps  = sog_mps;
-            s_live_sog_valid = true;
-          }
-        }
-      }
     }
 
     while (N2K_RawBridge_PopAssembledEvent(&asm_ev) != 0u) {
@@ -654,54 +597,6 @@ int main(void)
     }
 
     DeviceListHandler_PollState();
-
-    /* Periodically broadcast the boat-state packet (averages + VMG + live AWS/AWA). */
-    {
-      uint32_t now_ms = HAL_GetTick();
-      if ((now_ms - s_last_boat_state_ms) >= BOAT_STATE_SEND_INTERVAL_MS) {
-        /* Compute live apparent wind from true wind + SOG via vector math:
-         *   AWx = TWS * sin(TWA)
-         *   AWy = TWS * cos(TWA) + SOG
-         *   AWS = sqrt(AWx^2 + AWy^2)
-         *   AWA = atan2(AWx, AWy)  (degrees, normalised 0-360)
-         */
-        float nan_val = WindAverages_NaN();
-        float live_aws_mps = nan_val;
-        float live_awa_deg = nan_val;
-        if (s_live_tws_valid && s_live_sog_valid) {
-          float twa_rad = s_live_twa_deg * (3.14159265f / 180.0f);
-          float awx = s_live_tws_mps * sinf(twa_rad);
-          float awy = s_live_tws_mps * cosf(twa_rad) + s_live_sog_mps;
-          live_aws_mps = sqrtf(awx * awx + awy * awy);
-          float awa = atan2f(awx, awy) * (180.0f / 3.14159265f);
-          if (awa < 0.0f) { awa += 360.0f; }
-          live_awa_deg = awa;
-        }
-
-        /* Build the 36-byte payload inline using the same float-to-bytes
-         * approach as SPI_Packet_BuildBoatStatePacket so we avoid the double
-         * buffer. */
-        uint8_t bs_payload[SPI_PACKET_BOAT_STATE_PAYLOAD_LEN];
-        float   bs_values[9];
-        uint8_t vi;
-        bs_values[0] = s_wind_avg.aws.avg_60s;
-        bs_values[1] = s_wind_avg.aws.avg_5min;
-        bs_values[2] = s_wind_avg.aws.avg_30min;
-        bs_values[3] = s_wind_avg.tws.avg_60s;
-        bs_values[4] = s_wind_avg.tws.avg_5min;
-        bs_values[5] = s_wind_avg.tws.avg_30min;
-        bs_values[6] = s_wind_avg.vmg_ms;
-        bs_values[7] = live_aws_mps;
-        bs_values[8] = live_awa_deg;
-        for (vi = 0u; vi < 9u; vi++) {
-          memcpy(&bs_payload[vi * 4u], &bs_values[vi], 4u);
-        }
-        N2K_RawBridge_QueueSpiPacket(SPI_PACKET_TYPE_BOAT_STATE,
-                                     bs_payload,
-                                     SPI_PACKET_BOAT_STATE_PAYLOAD_LEN);
-        s_last_boat_state_ms = now_ms;
-      }
-    }
 
     /* Periodic CAN/SPI stats heartbeat — printed every 5 s.
      * can_rx=0 after bus activity → MCU is not receiving CAN frames.

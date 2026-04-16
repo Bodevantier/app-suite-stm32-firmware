@@ -55,7 +55,6 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/n2k_raw_bridge.c
     Core/Src/raw_ring_buffer.c
     Core/Src/spi_packet.c
-    Core/Src/wind_averages.c
 )
 
 # Add include paths
