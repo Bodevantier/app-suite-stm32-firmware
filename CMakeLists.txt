@@ -49,18 +49,19 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # User C++ sources - Main application
     Core/Src/main.cpp
-    Core/Src/devicelist_handler.cpp
 
     # Raw NMEA2000 to SPI bridge modules
     Core/Src/n2k_raw_bridge.c
     Core/Src/raw_ring_buffer.c
     Core/Src/spi_packet.c
+
+    # Device list handler (decodes AddressClaim/ProductInfo/PGNList on STM32)
+    Core/Src/devicelist_handler.cpp
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Inc
-    Core/Libs/NMEA2000-master
 )
 
 # Add project symbols (macros)

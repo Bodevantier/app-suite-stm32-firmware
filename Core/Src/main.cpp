@@ -25,8 +25,8 @@
 #include "gpio.h"
 
 /* USER CODE BEGIN Includes */
-#include "devicelist_handler.h"
 #include "n2k_raw_bridge.h"
+#include "devicelist_handler.h"
 #include <stdio.h>
 #include <string.h>
 /* USER CODE END Includes */
@@ -215,124 +215,15 @@ static uint8_t bridge_is_fast_packet(uint32_t pgn) {
 }
 
 /* ── Per-PGN decode & print ───────────────────────────────────────────── */
-/* ── Assembled fast-packet decode & print ────────────────────────────── */
-static void bridge_log_assembled_event(const N2K_RawBridgeAssembledEvent_t *ev) {
-  char line[160];
-  const uint8_t *d = ev->data;
-  uint16_t len = ev->len;
-  unsigned src = (unsigned)ev->src;
-
-  line[0] = '\0';
-
-  switch (ev->pgn) {
-
-  /* PGN 129029 – GNSS Position Data (43 bytes) */
-  case 129029u: {
-    if (len < 38u) break;
-    uint8_t  nsats  = d[33];
-    int16_t  hdop_r = n2k_s16(d, 34u);
-    int16_t  pdop_r = n2k_s16(d, 36u);
-    uint16_t days   = n2k_u16(d, 1u);
-    uint8_t  method = (uint8_t)((d[31] >> 4u) & 0x0Fu);
-    char hdop[8], pdop[8];
-    const char *mname = "NA";
-    if (method == 1u) mname = "GNSS";
-    else if (method == 2u) mname = "DGNSS";
-    else if (method == 3u) mname = "Precise";
-    else if (method == 4u) mname = "RTKFix";
-    else if (method == 5u) mname = "RTKFloat";
-    else if (method == 6u) mname = "DR";
-    fmt_dop(hdop, sizeof(hdop), hdop_r);
-    fmt_dop(pdop, sizeof(pdop), pdop_r);
-    (void)snprintf(line, sizeof(line),
-      "GNSS      sats=%2u  hdop=%6s  pdop=%6s  fix=%-8s  d1970=%5u  src=%2u\r\n",
-      (unsigned)nsats, hdop, pdop, mname, (unsigned)days, src);
-    break;
-  }
-
-  /* PGN 129539 – GNSS DOP (8 bytes) */
-  case 129539u: {
-    if (len < 8u) break;
-    int16_t hdop_r = n2k_s16(d, 2u);
-    int16_t vdop_r = n2k_s16(d, 4u);
-    int16_t tdop_r = n2k_s16(d, 6u);
-    char hdop[8], vdop[8], tdop[8];
-    fmt_dop(hdop, sizeof(hdop), hdop_r);
-    fmt_dop(vdop, sizeof(vdop), vdop_r);
-    fmt_dop(tdop, sizeof(tdop), tdop_r);
-    (void)snprintf(line, sizeof(line),
-      "GNSS_DOP  hdop=%6s  vdop=%6s  tdop=%6s  src=%2u\r\n",
-      hdop, vdop, tdop, src);
-    break;
-  }
-
-  /* PGN 129540 – GNSS Sats in View */
-  case 129540u: {
-    if (len < 3u) break;
-    {
-      static const char *rr_mode[] = {"Range+Res","RangeOnly","Unused2","NA"};
-      uint8_t mode = d[1] & 0x03u;
-      const char *mode_name = rr_mode[mode];
-    (void)snprintf(line, sizeof(line),
-      "GNSS_SATS  count=%2u  mode=%-9s  src=%2u\r\n",
-      (unsigned)d[2], mode_name, src);
-    }
-    break;
-  }
-
-  /* PGN 129284 – Navigation Data */
-  case 129284u: {
-    if (len < 16u) break;
-    uint32_t dtw_raw = n2k_u32(d, 1u);  /* u32 x 0.01 m */
-    uint16_t btw_raw = n2k_u16(d, 14u); /* u16 x 0.0001 rad */
-    char btw[12];
-    fmt_udeg(btw, sizeof(btw), btw_raw);
-    /* 1 Nm = 185200 raw units; tenths of Nm = raw / 18520 */
-    uint32_t dtw10 = dtw_raw / 18520u;
-    (void)snprintf(line, sizeof(line),
-      "NAV       dtw=%4lu.%1luNm  btw=%8s  src=%2u\r\n",
-      (unsigned long)(dtw10 / 10u), (unsigned long)(dtw10 % 10u),
-      btw, src);
-    break;
-  }
-
-  /* PGN 126996 – Product Information */
-  case 126996u: {
-    if (len < 4u) break;
-    char model[17];
-    uint16_t nv = n2k_u16(d, 0u);
-    uint16_t pc = n2k_u16(d, 2u);
-    n2k_copy_str(model, sizeof(model), &d[4], 16u);
-    (void)snprintf(line, sizeof(line),
-      "PRODUCT_INFO model=\"%s\" code=%u n2kv=%u src=%2u\r\n",
-      model, (unsigned)pc, (unsigned)nv, src);
-    break;
-  }
-
-  /* PGN 126998 – Configuration Information */
-  case 126998u: {
-    (void)snprintf(line, sizeof(line),
-      "CONFIG_INFO  len=%3u  src=%2u\r\n", (unsigned)len, src);
-    break;
-  }
-
-  /* All other assembled PGNs */
-  default: {
-    const char *name = bridge_pgn_name(ev->pgn);
-    (void)snprintf(line, sizeof(line),
-      "%s  pgn=%lu  assembled=%u  src=%u\r\n",
-      name ? name : "UNKNOWN", (unsigned long)ev->pgn, (unsigned)len, src);
-    break;
-  }
-
-  } /* switch */
-
-  if (line[0] != '\0') {
-    bridge_uart_print(line);
-  }
-}
-
 static void bridge_log_n2k_rx_event(const N2K_RawBridgeRxEvent_t *event) {
+  /* Only log identity/device-list PGNs.
+   * High-frequency telemetry (WIND, POS, COG_SOG, …) is suppressed here —
+   * the 5-second [STATS] heartbeat confirms bus health without flooding. */
+  if ((event->pgn != 60928u) &&  /* AddressClaim */
+      (event->pgn != 59904u)) {  /* ISO Request  */
+    return;
+  }
+
   char line[180];
   const uint8_t *d  = event->data;
   uint32_t       pgn = event->pgn;
@@ -566,6 +457,7 @@ int main(void)
   N2K_RawBridge_Init(&hcan, &hspi1);
   bridge_uart_print("N2K bridge init ok\r\n");
   DeviceListHandler_Init();
+  bridge_uart_print("DeviceListHandler init ok\r\n");
 
   /* USER CODE END 2 */
 
@@ -577,26 +469,25 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     N2K_RawBridgeRxEvent_t event;
-    N2K_RawBridgeAssembledEvent_t asm_ev;
-
-    DeviceListHandler_PollUart();
+    N2K_RawBridgeAssembledEvent_t assembled;
 
     N2K_RawBridge_Process();
 
+    DeviceListHandler_PollUart();
+    DeviceListHandler_PollState();
+
     while (N2K_RawBridge_PopLogEvent(&event) != 0u) {
       bridge_log_n2k_rx_event(&event);
-    }
-
-    while (N2K_RawBridge_PopRxEvent(&event) != 0u) {
       DeviceListHandler_OnRxEvent(&event);
     }
 
-    while (N2K_RawBridge_PopAssembledEvent(&asm_ev) != 0u) {
-      DeviceListHandler_OnAssembledEvent(&asm_ev);
-      bridge_log_assembled_event(&asm_ev);
+    while (N2K_RawBridge_PopAssembledEvent(&assembled) != 0u) {
+      DeviceListHandler_OnAssembledEvent(&assembled);
     }
 
-    DeviceListHandler_PollState();
+    /* No idle delay here — any HAL_Delay() in the main loop starves the
+     * CAN RX ring buffer (128 slots, 91 frames/s) during SPI bursts.
+     * The inter-frame pacing inside N2K_RawBridge_Process is sufficient. */
 
     /* Periodic CAN/SPI stats heartbeat — printed every 5 s.
      * can_rx=0 after bus activity → MCU is not receiving CAN frames.
@@ -608,24 +499,22 @@ int main(void)
         s_last_stats_ms = now_ms;
         N2K_RawBridgeStats_t   st  = N2K_RawBridge_GetStats();
         N2K_RawBridgePgnDebug_t dbg = N2K_RawBridge_GetPgnDebug();
-        char line[160];
+        char line[200];
         (void)snprintf(line, sizeof(line),
           "[STATS] t=%lus can_rx=%lu ovf=%lu spi_tx=%lu spi_rx=%lu "
-          "last_pgn=%lu last_src=%u updates=%lu\r\n",
+          "parse_errs=%lu last_pgn=%lu last_src=%u updates=%lu\r\n",
           (unsigned long)(now_ms / 1000u),
           (unsigned long)st.can_rx_frames,
           (unsigned long)st.can_rx_overflow,
           (unsigned long)st.spi_tx_frames,
           (unsigned long)st.spi_rx_packets,
+          (unsigned long)st.spi_parse_errors,
           (unsigned long)dbg.last_can_rx_pgn,
           (unsigned)dbg.last_can_rx_src,
           (unsigned long)dbg.can_rx_pgn_updates);
         bridge_uart_print(line);
       }
     }
-
-    /* Keep SPI side pacing unchanged while logging each N2K frame event. */
-    HAL_Delay(5u);
 
   }
   /* USER CODE END 3 */

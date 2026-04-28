@@ -4,7 +4,9 @@
 #include <string.h>
 #include <new>
 
-#include "N2kDeviceList.h"
+#ifndef N2kMaxBusDevices
+#define N2kMaxBusDevices 254
+#endif
 #include "main.h"
 #include "spi_packet.h"
 #include "usart.h"
@@ -18,8 +20,8 @@ constexpr uint32_t kPgnProductInfo = 126996u;
 constexpr uint32_t kPgnConfigInfo = 126998u;
 constexpr uint32_t kPgnPgnList = 126464u;
 
-constexpr uint32_t kRefreshQuietWindowMs = 500u;
-constexpr uint32_t kRefreshTimeoutMs = 7000u;
+constexpr uint32_t kRefreshQuietWindowMs = 300u;   /* was 500ms - faster quiet gate */
+constexpr uint32_t kRefreshTimeoutMs = 3000u;      /* was 7000ms - max wait for responses */
 constexpr uint32_t kDeviceOnlineMs = 10000u;
 constexpr uint32_t kSnapshotRetryBackoffMs = 40u;
 constexpr uint8_t kSnapshotMaxRetries = 5u;
@@ -206,6 +208,7 @@ DeviceInfo_t *find_or_alloc_device(uint8_t source) {
   (void)memset(device, 0, sizeof(*device));
   device->used = 1u;
   device->source = source;
+  device->last_seen_ms = HAL_GetTick();
   s_devices[source] = device;
   return device;
 }
@@ -483,6 +486,253 @@ void update_pgn_list(DeviceInfo_t *dev, const uint8_t *payload, uint16_t len) {
   }
 }
 
+/* -----------------------------------------------------------------------
+ * Human-readable device table printed to UART when a snapshot completes.
+ * Mirrors the PrintDeviceList() style of the Test_16 reference project.
+ * ----------------------------------------------------------------------- */
+static const char *resolve_manufacturer(uint16_t code) {
+  switch (code) {
+    case  69u: return "Actia";
+    case 135u: return "Navico/Simrad/B&G";
+    case 137u: return "Maretron";
+    case 144u: return "Lowrance";
+    case 147u: return "Furuno";
+    case 148u: return "Trimble";
+    case 154u: return "Garmin";
+    case 163u: return "Yamaha";
+    case 168u: return "SeaTalk/Raymarine";
+    case 176u: return "Northstar";
+    case 185u: return "Trimble";
+    case 192u: return "ICOM";
+    case 198u: return "Standard Horizon";
+    case 211u: return "True Heading";
+    case 215u: return "Cosworth";
+    case 224u: return "Airmar";
+    case 229u: return "Garmin";
+    case 274u: return "Furuno";
+    case 305u: return "B&G";
+    case 306u: return "Silva";
+    case 315u: return "Actisense";
+    case 328u: return "Humminbird";
+    case 344u: return "NovAtel";
+    case 373u: return "Garmin";
+    case 478u: return "Hemisphere GPS";
+    case 579u: return "True Heading";
+    case 824u: return "Rose Point";
+    case 890u: return "Johnson Outdoors";
+    case 1850u: return "Johnson Outdoors";
+    case 2046u: return "Open Source/Experimental";
+    default:   return nullptr;
+  }
+}
+
+static const char *safe_str(const char *s) {
+  return (s != nullptr && s[0] != '\0') ? s : "-";
+}
+
+static void print_pgn_row(const uint32_t *pgns, uint8_t count) {
+  char buf[128];
+  for (uint8_t i = 0u; i < count; i++) {
+    uint8_t col = i % 8u;
+    if (col == 0u) {
+      (void)snprintf(buf, sizeof(buf), "    ");
+      handler_uart_print(buf);
+    }
+    (void)snprintf(buf, sizeof(buf), "%lu%s",
+      (unsigned long)pgns[i],
+      (col == 7u || i == (count - 1u)) ? "\r\n" : ", ");
+    handler_uart_print(buf);
+  }
+}
+
+static void print_device_table(void) {
+  char line[200];
+  uint8_t count = count_seen_devices();
+  uint32_t now  = HAL_GetTick();
+
+  handler_uart_print("\r\n============================================================\r\n");
+  (void)snprintf(line, sizeof(line),
+    "[DEVICE TABLE] tick=%lums  total=%u devices\r\n",
+    (unsigned long)now, (unsigned)count);
+  handler_uart_print(line);
+  handler_uart_print("------------------------------------------------------------\r\n");
+
+  for (uint16_t i = 0u; i < kIdentitySlots; i++) {
+    DeviceInfo_t *dev = s_devices[i];
+    if ((dev == nullptr) || (dev->used == 0u)) {
+      continue;
+    }
+
+    bool online = ((now - dev->last_seen_ms) < kDeviceOnlineMs);
+    const char *mfr_name = resolve_manufacturer(dev->manufacturer);
+
+    /* Line 1: source, model, manufacturer */
+    if (mfr_name != nullptr) {
+      (void)snprintf(line, sizeof(line),
+        "Source %u  \"%s\"  Mfr: %s (%u)  UID: %lu  Product: %u\r\n",
+        (unsigned)dev->source,
+        safe_str(dev->model_id),
+        mfr_name,
+        (unsigned)dev->manufacturer,
+        (unsigned long)dev->unique,
+        (unsigned)dev->product);
+    } else {
+      (void)snprintf(line, sizeof(line),
+        "Source %u  \"%s\"  Mfr: code=%u  UID: %lu  Product: %u\r\n",
+        (unsigned)dev->source,
+        safe_str(dev->model_id),
+        (unsigned)dev->manufacturer,
+        (unsigned long)dev->unique,
+        (unsigned)dev->product);
+    }
+    handler_uart_print(line);
+
+    /* Line 2: device class / function / instance */
+    (void)snprintf(line, sizeof(line),
+      "  Class: %u  Function: %u  Instance: %u/%u  IG: %u  %s\r\n",
+      (unsigned)dev->device_class,
+      (unsigned)dev->device_function,
+      (unsigned)dev->device_instance,
+      (unsigned)dev->system_instance,
+      (unsigned)dev->industry_group,
+      online ? "Online" : "Offline");
+    handler_uart_print(line);
+
+    /* Line 3: software/model version, serial */
+    (void)snprintf(line, sizeof(line),
+      "  SW: \"%s\"  Model ver: \"%s\"  Serial: \"%s\"\r\n",
+      safe_str(dev->sw_version),
+      safe_str(dev->model_version),
+      safe_str(dev->serial));
+    handler_uart_print(line);
+
+    /* Line 4: manufacturer text + config strings */
+    (void)snprintf(line, sizeof(line),
+      "  Mfr text: \"%s\"  Install1: \"%s\"  Install2: \"%s\"\r\n",
+      safe_str(dev->manufacturer_text),
+      safe_str(dev->installation1),
+      safe_str(dev->installation2));
+    handler_uart_print(line);
+
+    /* Line 5: flags and seen mask */
+    (void)snprintf(line, sizeof(line),
+      "  Flags: AC=%u PI=%u CI=%u TX=%u RX=%u  "
+      "TX PGNs: %u  RX PGNs: %u  Last: %lums\r\n",
+      (unsigned)((dev->seen_mask & kMaskAddressClaim) != 0u),
+      (unsigned)((dev->seen_mask & kMaskProductInfo)  != 0u),
+      (unsigned)((dev->seen_mask & kMaskConfigInfo)   != 0u),
+      (unsigned)((dev->seen_mask & kMaskTxPgnList)    != 0u),
+      (unsigned)((dev->seen_mask & kMaskRxPgnList)    != 0u),
+      (unsigned)dev->tx_pgn_count,
+      (unsigned)dev->rx_pgn_count,
+      (unsigned long)dev->last_seen_ms);
+    handler_uart_print(line);
+
+    /* PGN lists */
+    if ((dev->tx_pgn != nullptr) && (dev->tx_pgn_count > 0u)) {
+      handler_uart_print("  TX PGNs:\r\n");
+      print_pgn_row(dev->tx_pgn, dev->tx_pgn_count);
+    }
+    if ((dev->rx_pgn != nullptr) && (dev->rx_pgn_count > 0u)) {
+      handler_uart_print("  RX PGNs:\r\n");
+      print_pgn_row(dev->rx_pgn, dev->rx_pgn_count);
+    }
+
+    handler_uart_print("\r\n");
+  }
+
+  handler_uart_print("============================================================\r\n\r\n");
+}
+
+/* Queue a single text line as a STATUS (0x03) SPI packet so the ESP32 can
+ * forward it via BLE to the Flutter app's DeviceListTextParser. */
+static void queue_text_line_to_spi(const char *text) {
+  uint8_t buf[SPI_PACKET_MAX_PAYLOAD_LEN];
+  size_t len = strlen(text);
+  if (len == 0u) {
+    return;
+  }
+  if (len > (sizeof(buf) - 1u)) {
+    len = sizeof(buf) - 1u;
+  }
+  (void)memcpy(buf, text, len);
+  buf[len] = '\n';
+  (void)N2K_RawBridge_QueueSpiPacket(SPI_PACKET_TYPE_STATUS, buf, (uint8_t)(len + 1u));
+}
+
+/* Sanitise a string value so it contains no '=' characters (which would
+ * confuse the key=value text parser on the Flutter side). */
+static void sanitise_field_value(char *dst, size_t dst_size, const char *src) {
+  size_t i = 0u;
+  if ((dst == nullptr) || (dst_size == 0u) || (src == nullptr) || (src[0] == '\0')) {
+    if (dst != nullptr && dst_size > 0u) {
+      dst[0] = '-'; dst[1] = '\0';
+    }
+    return;
+  }
+  for (; i < (dst_size - 1u) && src[i] != '\0'; i++) {
+    dst[i] = (src[i] == '=') ? '_' : src[i];
+  }
+  dst[i] = '\0';
+}
+
+/* Send the full device list as text STATUS packets that the ESP32 forwards to
+ * the Flutter app.  Format matches DeviceListTextParser expectations. */
+static void send_device_list_text_to_ble(uint16_t request_id) {
+  char line[220];
+  char name_buf[64];
+  char model_buf[64];
+  char mfr_buf[40];
+  uint8_t total = count_seen_devices();
+  uint32_t now = HAL_GetTick();
+
+  /* Header line */
+  (void)snprintf(line, sizeof(line),
+    "device_list snapshot id=%u complete=true expected=%u received=%u",
+    (unsigned)request_id,
+    (unsigned)total,
+    (unsigned)total);
+  queue_text_line_to_spi(line);
+
+  /* One line per known device */
+  for (uint16_t i = 0u; i < kIdentitySlots; i++) {
+    DeviceInfo_t *dev = s_devices[i];
+    if ((dev == nullptr) || (dev->used == 0u)) {
+      continue;
+    }
+    bool online = ((now - dev->last_seen_ms) < kDeviceOnlineMs);
+    bool is_gw  = (dev->source == kOwnN2kSource);
+
+    sanitise_field_value(name_buf,  sizeof(name_buf),  safe_str(dev->model_id));
+    sanitise_field_value(model_buf, sizeof(model_buf),
+      (dev->model_version != nullptr && dev->model_version[0] != '\0')
+        ? dev->model_version : safe_str(dev->model_id));
+
+    const char *resolved = resolve_manufacturer(dev->manufacturer);
+    sanitise_field_value(mfr_buf, sizeof(mfr_buf),
+      (resolved != nullptr) ? resolved : "-");
+
+    (void)snprintf(line, sizeof(line),
+      "device src=%u name=%s model=%s mfg=%u manufacturer=%s"
+      " online=%s hasaddressclaim=%s hasproductinfo=%s"
+      " tx=%s rx=%s deviceclass=%u devicefunction=%u gateway=%s",
+      (unsigned)dev->source,
+      name_buf,
+      model_buf,
+      (unsigned)dev->manufacturer,
+      mfr_buf,
+      online    ? "true" : "false",
+      (dev->seen_mask & kMaskAddressClaim) ? "true" : "false",
+      (dev->seen_mask & kMaskProductInfo)  ? "true" : "false",
+      (dev->tx_pgn_count > 0u) ? "true" : "false",
+      (dev->rx_pgn_count > 0u) ? "true" : "false",
+      (unsigned)dev->device_class,
+      (unsigned)dev->device_function,
+      is_gw ? "true" : "false");
+    queue_text_line_to_spi(line);
+  }
+}
+
 uint8_t emit_device_list_snapshot(uint16_t request_id) {
   uint8_t msg[SPI_PACKET_MAX_PAYLOAD_LEN];
   uint8_t total = count_seen_devices();
@@ -628,6 +878,9 @@ uint8_t emit_device_list_snapshot(uint16_t request_id) {
     (unsigned)index);
   handler_uart_print(line);
 
+  print_device_table();
+  send_device_list_text_to_ble(request_id);
+
   return 1u;
 }
 
@@ -727,13 +980,34 @@ void process_snapshot_retry(void) {
   s_snapshot_retry_at_ms = now + kSnapshotRetryBackoffMs;
 }
 
+/* Soft reset for a new refresh cycle: keep device identity and cached text
+   data so previously-known devices still appear immediately in the new
+   snapshot.  Only reset the tracking bits so fresh PGN-list requests are
+   re-sent for all known devices.  This fixes the "deleted / re-connected
+   device never shows up again" symptom. */
+static void soft_reset_for_refresh(void) {
+  for (uint16_t i = 0u; i < kIdentitySlots; i++) {
+    if (s_devices[i] != nullptr) {
+      s_devices[i]->request_mask = 0u;               /* allow re-requesting metadata */
+      s_devices[i]->seen_mask   &= kMaskAddressClaim; /* keep AC bit, clear PGN/prod/cfg */
+    }
+  }
+}
+
 void start_refresh_request(uint16_t req_id, uint32_t requested_pgn, uint8_t dst, const char *origin) {
   char line[180];
   uint8_t sent;
+  uint8_t had_devices = count_seen_devices();
 
   sent = N2K_RawBridge_SendIsoRequest(kOwnN2kSource, dst, requested_pgn);
   if (sent != 0u) {
-    reset_refresh_tracking();
+    /* Soft reset: keep old device data for faster re-display; only clear
+       tracking state so metadata is re-fetched for all devices. */
+    soft_reset_for_refresh();
+    (void)snprintf(line, sizeof(line),
+      "[SRESET] keeping %u known devices, resetting tracking\r\n",
+      (unsigned)had_devices);
+    handler_uart_print(line);
     s_refresh_pending = 1u;
     s_active_request_id = req_id;
     s_refresh_started_ms = HAL_GetTick();
@@ -766,6 +1040,7 @@ void start_refresh_request(uint16_t req_id, uint32_t requested_pgn, uint8_t dst,
 
 void DeviceListHandler_Init(void) {
   reset_refresh_tracking();
+  N2K_RawBridge_ResetSeenSources();
   s_refresh_pending = 0u;
   s_request_id = 1u;
   s_active_request_id = 0u;
@@ -779,7 +1054,19 @@ void DeviceListHandler_Init(void) {
   s_devlist_retry_count = 0u;
   s_devlist_retry_giveup_count = 0u;
   s_devlist_alloc_fail_count = 0u;
-  handler_uart_print("[CMD] Type 'r' to send ISO Request for Address Claim (60928)\r\n");
+
+  /* Send an ISO Request for Address Claim on boot so the app receives
+     device identity frames as soon as the N2K bus is ready.
+     Raw responses are forwarded via n2k_raw_bridge.c -> SPI -> ESP32 -> BLE.
+     The Flutter app's N2kDeviceTracker builds the device list from those frames.
+     s_refresh_pending must be 1 so that OnRxEvent processes the ADDR_CLAIM
+     responses and sends follow-up ISO requests for PRODUCT_INFO etc. */
+  N2K_RawBridge_SendIsoRequest(kOwnN2kSource, kIsoDstGlobal, kPgnAddressClaim);
+  s_refresh_pending = 1u;
+  s_refresh_started_ms = HAL_GetTick();
+  s_refresh_last_activity_ms = s_refresh_started_ms;
+  handler_uart_print("[INIT] ISO Request broadcast sent (addr claim)\r\n");
+  handler_uart_print("[CMD] Type 'r' to re-request device list\r\n");
 }
 
 void DeviceListHandler_PollUart(void) {
@@ -953,45 +1240,75 @@ void DeviceListHandler_OnAssembledEvent(const N2K_RawBridgeAssembledEvent_t *eve
 }
 
 void DeviceListHandler_PollState(void) {
-  char line[120];
-  uint32_t now;
+  uint8_t src;
 
-  process_snapshot_retry();
+  /* Drain the new-source queue.  When a device broadcasts data PGNs
+   * (wind, GPS, depth, etc.) without responding to the boot-time
+   * broadcast ISO Request for ADDR_CLAIM, we send a unicast ISO Request
+   * directly to it.  Most N2K devices respond to unicast requests even
+   * when they silently ignore the broadcast. */
+  while (N2K_RawBridge_PopNewSource(&src) != 0u) {
+    DeviceInfo_t *dev;
+    if ((src == kOwnN2kSource)) {
+      continue;
+    }
+    dev = find_or_alloc_device(src);
+    if ((dev != nullptr) &&
+        ((dev->seen_mask & kMaskAddressClaim) == 0u) &&
+        ((dev->request_mask & 0x80u) == 0u)) {
+      dev->request_mask |= 0x80u;  /* bit 7: unicast addr-claim solicited */
+      send_follow_up_request(src, kPgnAddressClaim, "sniff");
+    }
+  }
 
+  /* ---- Scan-completion check -------------------------------------------- *
+   * Fire the snapshot when either:
+   *   a) kRefreshQuietWindowMs has passed with no new AddressClaim activity, OR
+   *   b) kRefreshTimeoutMs has elapsed since the scan started (hard deadline).
+   * Both conditions require s_refresh_pending to be set. */
+  if (s_refresh_pending != 0u) {
+    uint32_t now = HAL_GetTick();
+    uint32_t quiet_ms  = (uint32_t)(now - s_refresh_last_activity_ms);
+    uint32_t total_ms  = (uint32_t)(now - s_refresh_started_ms);
+
+    if ((quiet_ms >= kRefreshQuietWindowMs) ||
+        (total_ms >= kRefreshTimeoutMs)) {
+      uint8_t ok;
+      char line[120];
+      (void)snprintf(line, sizeof(line),
+        "[SCAN] complete quiet=%lums total=%lums devices=%u\r\n",
+        (unsigned long)quiet_ms,
+        (unsigned long)total_ms,
+        (unsigned)count_seen_devices());
+      handler_uart_print(line);
+
+      ok = emit_device_list_snapshot(s_active_request_id);
+      if (ok == 0u) {
+        schedule_snapshot_retry(s_active_request_id);
+      }
+      s_refresh_pending = 0u;  /* close this scan cycle */
+    }
+  }
+
+  /* ---- Periodic auto-rescan -------------------------------------------- *
+   * If no scan is active and ≥30 s have passed since the last one, start a
+   * new broadcast scan.  This picks up devices that were slow to boot or
+   * that didn't respond to the initial request. */
   if (s_refresh_pending == 0u) {
-    return;
+    static uint32_t s_last_rescan_ms = 0u;
+    uint32_t now2 = HAL_GetTick();
+    if (s_last_rescan_ms == 0u) {
+      s_last_rescan_ms = now2;  /* skip first 30 s after boot */
+    } else if ((uint32_t)(now2 - s_last_rescan_ms) >= 30000u) {
+      s_last_rescan_ms = now2;
+      start_refresh_request(s_request_id, kPgnAddressClaim, kIsoDstGlobal, "AUTO");
+      s_request_id++;
+      if (s_request_id == 0u) {
+        s_request_id = 1u;
+      }
+    }
   }
 
-  now = HAL_GetTick();
-  if (all_tracked_devices_have_pgn_lists() != 0u &&
-      (uint32_t)(now - s_refresh_last_activity_ms) >= kRefreshQuietWindowMs) {
-    if (emit_device_list_snapshot(s_active_request_id) == 0u) {
-      schedule_snapshot_retry(s_active_request_id);
-    }
-    (void)snprintf(line, sizeof(line),
-      "[REQ] id=%u complete ready=%u/%u qovf=%lu oom=%lu\r\n",
-      (unsigned)s_active_request_id,
-      (unsigned)count_ready_devices(),
-      (unsigned)count_seen_devices(),
-      (unsigned long)s_devlist_queue_overflow_count,
-      (unsigned long)s_devlist_alloc_fail_count);
-    handler_uart_print(line);
-    s_refresh_pending = 0u;
-    return;
-  }
-
-  if ((uint32_t)(now - s_refresh_started_ms) >= kRefreshTimeoutMs) {
-    if (emit_device_list_snapshot(s_active_request_id) == 0u) {
-      schedule_snapshot_retry(s_active_request_id);
-    }
-    (void)snprintf(line, sizeof(line),
-      "[REQ] id=%u timeout ready=%u/%u qovf=%lu oom=%lu\r\n",
-      (unsigned)s_active_request_id,
-      (unsigned)count_ready_devices(),
-      (unsigned)count_seen_devices(),
-      (unsigned long)s_devlist_queue_overflow_count,
-      (unsigned long)s_devlist_alloc_fail_count);
-    handler_uart_print(line);
-    s_refresh_pending = 0u;
-  }
+  /* Handle any pending SPI-queue retry (independent of active scan). */
+  process_snapshot_retry();
 }
