@@ -12,7 +12,16 @@
 #include "usart.h"
 
 namespace {
+/* Display/identity address used in BLE device-list snapshots so the Flutter
+   app sees the bridge as a labelled gateway entry. The bridge does NOT run an
+   address-claim for this source — it is purely a label. */
 constexpr uint8_t kOwnN2kSource = 15u;
+/* Source address used when the bridge transmits ISO Requests (PGN 59904).
+   Per ISO 11783 / NMEA 2000 §3.5, a node may only transmit on a source it has
+   claimed via PGN 60928. Since this bridge does NOT participate in address
+   claim, all bridge-originated requests use the NULL source 0xFE
+   ("anonymous requester"), which is the standard compliant lurker pattern. */
+constexpr uint8_t kIsoRequestSrc = 0xFEu;
 constexpr uint8_t kIsoDstGlobal = 255u;
 constexpr uint32_t kPgnIsoRequest = 59904u;
 constexpr uint32_t kPgnAddressClaim = 60928u;
@@ -895,7 +904,7 @@ void mark_seen(uint8_t source, uint8_t bit) {
 
 uint8_t send_follow_up_request(uint8_t dst, uint32_t requested_pgn, const char *label) {
   char line[160];
-  uint8_t sent = N2K_RawBridge_SendIsoRequest(kOwnN2kSource, dst, requested_pgn);
+  uint8_t sent = N2K_RawBridge_SendIsoRequest(kIsoRequestSrc, dst, requested_pgn);
 
   (void)snprintf(line, sizeof(line),
     "[REQ:FOLLOWUP] src=%u req=%lu %s result=%s\r\n",
@@ -999,7 +1008,7 @@ void start_refresh_request(uint16_t req_id, uint32_t requested_pgn, uint8_t dst,
   uint8_t sent;
   uint8_t had_devices = count_seen_devices();
 
-  sent = N2K_RawBridge_SendIsoRequest(kOwnN2kSource, dst, requested_pgn);
+  sent = N2K_RawBridge_SendIsoRequest(kIsoRequestSrc, dst, requested_pgn);
   if (sent != 0u) {
     /* Soft reset: keep old device data for faster re-display; only clear
        tracking state so metadata is re-fetched for all devices. */
@@ -1018,7 +1027,7 @@ void start_refresh_request(uint16_t req_id, uint32_t requested_pgn, uint8_t dst,
       origin,
       (unsigned)req_id,
       (unsigned long)HAL_GetTick(),
-      (unsigned)kOwnN2kSource,
+      (unsigned)kIsoRequestSrc,
       (unsigned)dst,
       (unsigned long)kPgnIsoRequest,
       (unsigned long)requested_pgn,
@@ -1061,7 +1070,7 @@ void DeviceListHandler_Init(void) {
      The Flutter app's N2kDeviceTracker builds the device list from those frames.
      s_refresh_pending must be 1 so that OnRxEvent processes the ADDR_CLAIM
      responses and sends follow-up ISO requests for PRODUCT_INFO etc. */
-  N2K_RawBridge_SendIsoRequest(kOwnN2kSource, kIsoDstGlobal, kPgnAddressClaim);
+  N2K_RawBridge_SendIsoRequest(kIsoRequestSrc, kIsoDstGlobal, kPgnAddressClaim);
   s_refresh_pending = 1u;
   s_refresh_started_ms = HAL_GetTick();
   s_refresh_last_activity_ms = s_refresh_started_ms;
