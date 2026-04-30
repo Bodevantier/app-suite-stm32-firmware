@@ -18,6 +18,11 @@ extern "C" {
 #define SPI_PACKET_TYPE_STATUS 0x03u
 #define SPI_PACKET_TYPE_DEVICE_LIST 0x10u
 #define SPI_PACKET_TYPE_DEVICE_LIST_REQUEST 0x11u
+/* App-driven "forget this N2K node" command. Payload: single byte = src.
+ * The bridge frees its cached identity slot for that source so the next
+ * device-list snapshot no longer mentions it. The src will reappear if
+ * the device transmits AddressClaim again. */
+#define SPI_PACKET_TYPE_DEVICE_FORGET 0x12u
 #define SPI_PACKET_PAYLOAD_LEN 18u
 #define SPI_PACKET_TOTAL_LEN (2u + 1u + 1u + SPI_PACKET_PAYLOAD_LEN + 1u)
 #define SPI_PACKET_MAX_PAYLOAD_LEN 250u

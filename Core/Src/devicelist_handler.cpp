@@ -1128,6 +1128,30 @@ void DeviceListHandler_OnSpiRequest(const uint8_t *payload, uint8_t payload_len)
   }
 }
 
+uint8_t DeviceListHandler_ForgetDevice(uint8_t source) {
+  if (source >= kIdentitySlots) {
+    return 0u;
+  }
+  DeviceInfo_t *dev = s_devices[source];
+  if (dev == nullptr) {
+    return 0u;
+  }
+  /* Refuse to forget the bridge's own identity slot \u2014 the BLE app needs it
+   * to render the gateway entry. */
+  if (source == kOwnN2kSource) {
+    return 0u;
+  }
+  free_device(dev);
+  s_devices[source] = nullptr;
+
+  char line[64];
+  (void)snprintf(line, sizeof(line),
+                 "[devlist] forgot src=%u (app request)\r\n",
+                 (unsigned)source);
+  handler_uart_print(line);
+  return 1u;
+}
+
 void DeviceListHandler_OnRxEvent(const N2K_RawBridgeRxEvent_t *event) {
   DeviceInfo_t *dev;
   uint64_t name;

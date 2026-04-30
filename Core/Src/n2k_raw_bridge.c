@@ -391,6 +391,15 @@ static void raw_bridge_handle_spi_packet(const uint8_t *packet, uint16_t packet_
         return;
     }
 
+    if (pkt_type == SPI_PACKET_TYPE_DEVICE_FORGET) {
+        s_stats.spi_rx_packets++;
+        /* Payload is a single byte: the N2K source address to drop. */
+        if (packet[3] >= 1u) {
+            (void)DeviceListHandler_ForgetDevice(packet[4]);
+        }
+        return;
+    }
+
     s_stats.spi_parse_errors++;
 }
 
