@@ -652,7 +652,9 @@ void N2K_RawBridge_Process(void) {
             if (raw_bridge_spi_transfer(packet, spi_rx, queued_len) != 0u) {
                 sent = 1u;
                 s_stats.spi_tx_frames++;
+#if !BRIDGE_DISABLE_LEDS
                 HAL_GPIO_TogglePin(LED2_GPIO_Port, LED2_Pin);
+#endif
                 break;
             }
             HAL_Delay(1u);
@@ -711,7 +713,9 @@ void N2K_RawBridge_Process(void) {
 
         if (raw_bridge_spi_transfer(packet, spi_rx, (uint16_t)packet_len) != 0u) {
             s_stats.spi_tx_frames++;
+#if !BRIDGE_DISABLE_LEDS
             HAL_GPIO_TogglePin(LED2_GPIO_Port, LED2_Pin);
+#endif
         }
         frames_sent++;
     }
@@ -903,7 +907,9 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
         if (!RawRingBuffer_Push(&s_ring, &frame)) {
             s_stats.can_rx_overflow++;
         } else {
+#if !BRIDGE_DISABLE_LEDS
             HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+#endif
         }
     }
 }

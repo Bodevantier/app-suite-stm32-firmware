@@ -39,6 +39,30 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+/* Power saving: silence the per-PGN identity trace (ADDR_CLAIM /
+ * ISO_REQUEST) and the periodic [STATS] heartbeat printed every 5 s.
+ * Boot banner + N2K/SPI init lines are kept so a USB-TTL probe still
+ * confirms the bridge came up. Set to 0 to get the chatty traces back
+ * for diagnostics.  USART1 transmits at 115200 baud — every printed
+ * line wakes the MCU (via TX-empty IRQ) and burns a few mA-ms. */
+#define BRIDGE_QUIET_DEBUG 1
+
+/* Power saving: enter WFI at the bottom of the main loop. CAN RX, SPI,
+ * USART and SysTick (1 kHz) all wake the MCU promptly so loop latency
+ * is unchanged.  Disable only when chasing real-time bugs that need the
+ * loop to spin freely. */
+#define BRIDGE_USE_WFI 1
+
+/* Power saving: keep both debug LEDs (LED1=PB8, LED2=PB9) dark.  On this
+ * PCB the LEDs are wired active-HIGH (MCU pin -> 330R -> LED anode ->
+ * GND), so PIN_RESET = OFF.  The bridge module (n2k_raw_bridge.c)
+ * toggles LED1 on every CAN RX and LED2 on every SPI TX, so without
+ * this guard they are essentially always lit on a live N2K bus.
+ * Each LED draws ~10 mA continuous when on.  The macro is defined
+ * in main.h so n2k_raw_bridge.c can see it too.  Set to 0 in main.h
+ * to re-enable LED activity for diagnostics. */
+#define BRIDGE_DISABLE_LEDS 1
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -74,6 +98,10 @@ static void bridge_uart_print(const char *msg) {
  * used to live here for PGN 126720) so it never floods at full sensor
  * rate. Don't reintroduce always-on decoders. */
 static void bridge_log_n2k_rx_event(const N2K_RawBridgeRxEvent_t *event) {
+#if BRIDGE_QUIET_DEBUG
+  (void)event;
+  return;
+#else
   if ((event->pgn != 60928u) &&  /* AddressClaim */
       (event->pgn != 59904u)) {  /* ISO Request  */
     return;
@@ -114,6 +142,7 @@ static void bridge_log_n2k_rx_event(const N2K_RawBridgeRxEvent_t *event) {
   }
 
   bridge_uart_print(line);
+#endif /* BRIDGE_QUIET_DEBUG */
 }
 
 /* USER CODE END 0 */
@@ -150,6 +179,15 @@ int main(void)
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+
+#if BRIDGE_DISABLE_LEDS
+  /* Belt-and-braces: the LEDs are active-HIGH on this board and gpio.c
+   * already inits them LOW, but force them off here so any future code
+   * that left them HIGH (e.g. via a bootloader handoff) is corrected
+   * before main loop starts. */
+  HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
+#endif
 
   bridge_uart_print("N2K bridge boot\r\n");
 
@@ -191,6 +229,7 @@ int main(void)
     /* Periodic CAN/SPI stats heartbeat — printed every 5 s.
      * can_rx=0 after bus activity → MCU is not receiving CAN frames.
      * can_rx>0 but no PGN lines → rx-event path is broken. */
+#if !BRIDGE_QUIET_DEBUG
     {
       static uint32_t s_last_stats_ms = 0u;
       uint32_t now_ms = HAL_GetTick();
@@ -214,7 +253,16 @@ int main(void)
         bridge_uart_print(line);
       }
     }
+#endif /* !BRIDGE_QUIET_DEBUG */
 
+#if BRIDGE_USE_WFI
+    /* Sleep the core until the next interrupt (CAN RX, SPI, USART, or
+     * SysTick at 1 kHz). All of these wake the MCU promptly so the loop
+     * latency is unchanged, but during the (short) idle gaps between
+     * CAN frames the core stops clocking — measurable ~3-6 mA saving on
+     * an STM32F103 at 72 MHz. */
+    __WFI();
+#endif
   }
   /* USER CODE END 3 */
 }
@@ -234,7 +282,9 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
   RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  /* Power saving: HSI is not needed once the PLL is locked off HSE.
+   * Disabling it saves ~200 µA continuous on the 3.3 V rail. */
+  RCC_OscInitStruct.HSIState = RCC_HSI_OFF;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;

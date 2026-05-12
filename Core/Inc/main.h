@@ -68,6 +68,16 @@ void Error_Handler(void);
 
 /* USER CODE BEGIN Private defines */
 
+/* Power saving: keep both debug LEDs (LED1=PB8, LED2=PB9) dark.
+ * The bridge module toggles LED1 on every CAN RX frame and LED2 on
+ * every SPI TX frame, which on a busy N2K bus (~91 fr/s) means both
+ * LEDs are essentially on all the time, drawing ~10 mA each.
+ * Defined here (not in main.cpp) so n2k_raw_bridge.c can also see it.
+ * Set to 0 to re-enable LED activity for diagnostics. */
+#ifndef BRIDGE_DISABLE_LEDS
+#define BRIDGE_DISABLE_LEDS 1
+#endif
+
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus
